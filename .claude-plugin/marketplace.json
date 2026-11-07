@@ -1,0 +1,5 @@
+{
+  "name": "claude-session-roster",
+  "owner": { "name": "orkineric" },
+  "plugins": [{ "name": "session-roster", "source": "./" }]
+}
