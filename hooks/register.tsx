@@ -9,31 +9,56 @@ const sent = atom({ plugin: 'session-roster', key: 'sent' } as const, [] as Sent
 const tick = atom({ plugin: 'session-roster', key: 'tick' } as const, 0, { shape: 'tick-1' })
 
 type Sent = { to: string; name: string; text: string; at: number; ok: boolean }
-type Row = { id: string; name: string; repo: string; cwd: string; status: string; ago: string; mine: boolean; done: number; total: number; tmux: string }
+type Row = { id: string; name: string; repo: string; cwd: string; status: string; ago: string; mine: boolean; done: number; total: number; partial: number; tmux: string }
 
-// Per-session task list (~/.claude/tasks/<sessionId>/N.json): completed / total.
-async function progressOf($: any, id: string): Promise<{ done: number; total: number }> {
+const DEFAULT_TASK_MS = 5 * 60_000 // expected task length until we have finished tasks to learn from
+
+// Per-session task list (~/.claude/tasks/<sessionId>/N.json): completed / total, plus
+// `partial`, the estimated fraction of in-progress tasks already done. A task file's mtime
+// is when it last changed state, so a completed task's length is the gap since the previous
+// completion, and an in-progress task's elapsed time is now - its mtime (or the last
+// completion, if later). Credit = elapsed / (elapsed + expected): grows with time, never hits 1.
+async function progressOf($: any, id: string, now: number): Promise<{ done: number; total: number; partial: number }> {
   try {
     const dir = `${HOME}/.claude/tasks/${id}`
     let done = 0
     let total = 0
+    const finished: number[] = []
+    const running: number[] = []
     for (const f of (await $.fs.list(dir)).filter((x: any) => /^\d+\.json$/.test(x.name))) {
-      const t = JSON.parse(await $.fs.read(`${dir}/${f.name}`))
+      const path = `${dir}/${f.name}`
+      const t = JSON.parse(await $.fs.read(path))
       if (t.status === 'deleted') continue
       total++
-      if (t.status === 'completed') done++
+      if (t.status === 'completed') {
+        done++
+        finished.push((await $.fs.stat(path)).mtimeMs)
+      } else if (t.status === 'in_progress') {
+        running.push((await $.fs.stat(path)).mtimeMs)
+      }
     }
-    return { done, total }
+    finished.sort((a, b) => a - b)
+    const gaps = finished.slice(1).map((m, i) => m - finished[i]).filter(g => g > 0)
+    const expected = gaps.length > 0 ? Math.max(30_000, gaps.reduce((a, b) => a + b, 0) / gaps.length) : DEFAULT_TASK_MS
+    const lastDone = finished[finished.length - 1] ?? 0
+    let partial = 0
+    for (const m of running) {
+      const elapsed = Math.max(0, now - Math.max(m, lastDone))
+      partial += elapsed / (elapsed + expected)
+    }
+    return { done, total, partial: Math.min(partial, Math.max(0, total - done - 0.01)) }
   } catch {
-    return { done: 0, total: 0 }
+    return { done: 0, total: 0, partial: 0 }
   }
 }
 
 const W = 24
 function bar(r: Row, t: number): string {
   if (r.total > 0) {
-    const n = Math.round((W * r.done) / r.total)
-    return `${'█'.repeat(n)}${'░'.repeat(W - n)} ${r.done}/${r.total}`
+    const frac = Math.min(1, (r.done + r.partial) / r.total)
+    const solid = Math.round((W * r.done) / r.total)
+    const est = Math.max(solid, Math.round(W * frac))
+    return `${'█'.repeat(solid)}${'▓'.repeat(est - solid)}${'░'.repeat(W - est)} ${r.done}/${r.total} ~${Math.round(frac * 100)}%`
   }
   if (r.status !== 'busy') return ''
   const at = (t * 3) % (W - 4)
@@ -84,7 +109,7 @@ async function sessions($: any): Promise<Row[]> {
         ago: ago(now - (s.statusUpdatedAt ?? s.updatedAt ?? now)),
         mine: s.sessionId === me,
         tmux: s.tmux ?? '',
-        ...(await progressOf($, s.sessionId)),
+        ...(await progressOf($, s.sessionId, now)),
       })
     } catch {}
   }
