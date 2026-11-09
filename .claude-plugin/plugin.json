@@ -1,1 +1,1 @@
-{ "name": "session-roster", "version": "0.1.1", "description": "Pane listing open Claude Code sessions (name, repo, activity) with a box to message the selected one.", "types": "./types/index.d.ts" }
+{ "name": "session-roster", "version": "0.1.2", "description": "Pane listing open Claude Code sessions (name, repo, activity) with a box to message the selected one.", "types": "./types/index.d.ts" }

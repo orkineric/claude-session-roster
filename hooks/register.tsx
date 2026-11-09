@@ -9,7 +9,30 @@ const sent = atom({ plugin: 'session-roster', key: 'sent' } as const, [] as Sent
 const tick = atom({ plugin: 'session-roster', key: 'tick' } as const, 0, { shape: 'tick-1' })
 
 type Sent = { to: string; name: string; text: string; at: number; ok: boolean }
-type Row = { id: string; name: string; repo: string; cwd: string; status: string; ago: string; mine: boolean; done: number; total: number; partial: number; tmux: string }
+// The agent's own estimate, from ~/.claude/session-roster/<sessionId>.json (see the prompt.compose hook).
+type Est = { pct: number; eta: number | null; note: string; ageMs: number }
+const STALE_MS = 20 * 60_000
+
+async function estimateOf($: any, id: string, now: number): Promise<Est | null> {
+  try {
+    const path = `${HOME}/.claude/session-roster/${id}.json`
+    const j = JSON.parse(await $.fs.read(path))
+    const pct = Number(j.pct)
+    if (!Number.isFinite(pct)) return null
+    const mtime = (await $.fs.stat(path)).mtimeMs
+    const eta = Number(j.eta_min)
+    return {
+      pct: Math.max(0, Math.min(100, Math.round(pct))),
+      eta: Number.isFinite(eta) && eta >= 0 ? Math.round(eta) : null,
+      note: typeof j.note === 'string' ? j.note.slice(0, 40) : '',
+      ageMs: Math.max(0, now - mtime),
+    }
+  } catch {
+    return null
+  }
+}
+
+type Row = { id: string; name: string; repo: string; cwd: string; status: string; ago: string; mine: boolean; done: number; total: number; partial: number; est: Est | null; tmux: string }
 
 const DEFAULT_TASK_MS = 5 * 60_000 // expected task length until we have finished tasks to learn from
 
@@ -54,6 +77,14 @@ async function progressOf($: any, id: string, now: number): Promise<{ done: numb
 
 const W = 24
 function bar(r: Row, t: number): string {
+  // The agent's judgement of the remaining work beats a task-count guess; only while busy.
+  if (r.est && r.status === 'busy') {
+    const e = r.est
+    const n = Math.round((W * e.pct) / 100)
+    const stale = e.ageMs > STALE_MS ? ` stale ${ago(e.ageMs)}` : ''
+    const eta = e.eta !== null && !stale ? ` ~${e.eta}m left` : ''
+    return `${'█'.repeat(n)}${'░'.repeat(W - n)} ~${e.pct}%${eta}${stale}${e.note ? ` ${e.note}` : ''}`
+  }
   if (r.total > 0) {
     const frac = Math.min(1, (r.done + r.partial) / r.total)
     const solid = Math.round((W * r.done) / r.total)
@@ -110,6 +141,7 @@ async function sessions($: any): Promise<Row[]> {
         mine: s.sessionId === me,
         tmux: s.tmux ?? '',
         ...(await progressOf($, s.sessionId, now)),
+        est: await estimateOf($, s.sessionId, now),
       })
     } catch {}
   }
@@ -117,6 +149,20 @@ async function sessions($: any): Promise<Row[]> {
 }
 
 export const register: Register = on => {
+  // Ask every session's agent to keep an estimate file the pane reads. Same text for the whole thread.
+  on('prompt.compose', async ($, e, next) => {
+    const res = await next(e)
+    const id = await $.session.id()
+    const home = (await $.env.get('HOME')) ?? ''
+    const text = [
+      '# Progress estimate for the session-roster pane',
+      `For work you expect to take more than about 2 minutes, keep ${home}/.claude/session-roster/${id}.json up to date (create the folder if needed) so the user's Sessions pane can show a progress bar:`,
+      '{"pct": 0-100, "eta_min": minutes remaining, "note": "<=40 chars on what you are doing"}',
+      'Judge pct and eta_min from the complexity of the work still ahead (files to change, test and build runtimes, remaining steps), not from time spent. Write it when you start, at each milestone, and before you begin a long wait such as a test suite or build, with the wait counted in the eta. One short Bash command is enough; do not mention it to the user. Skip it for quick answers.',
+    ].join('\n')
+    return { sections: [...res.sections, { id: 'session-roster:estimate', text, scope: 'session' as const }] }
+  })
+
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'sessions', description: 'Show open Claude Code sessions and message them' })
     void $.ui.open({ id: PANE, title: 'Sessions' })
